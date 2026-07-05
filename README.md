@@ -81,6 +81,11 @@ On X11, Linux global shortcuts are registered through `keybinder-3.0`. On
 Wayland, they are registered through the desktop portal, so the compositor may
 show a permission dialog the first time shortcuts are bound. Portal support for
 `capsLock` and `fn` modifiers depends on the compositor and may be unavailable.
+Recent versions of `xdg-desktop-portal` also require host applications to have
+an installed `.desktop` file whose basename matches the Linux `application-id`
+(for example, `com.example.MyApp.desktop` for `com.example.MyApp`). Compositors
+without a GlobalShortcuts portal backend, such as some Niri/wlroots setups, will
+still reject Wayland global shortcut registration.
 
 ### Usage
 

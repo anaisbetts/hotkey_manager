@@ -18,6 +18,12 @@ desktop portal. The compositor may show a permission dialog the first time
 shortcuts are bound. The portal backend emits both `onKeyDown` and `onKeyUp`
 events when the compositor sends activation and deactivation signals.
 
+Recent versions of `xdg-desktop-portal` require host applications to have an
+installed `.desktop` file whose basename matches the Linux `application-id`
+(for example, `com.example.MyApp.desktop` for `com.example.MyApp`). Wayland
+compositors without a GlobalShortcuts portal backend, such as some Niri/wlroots
+setups, will still reject global shortcut registration.
+
 The Wayland portal does not have portable equivalents for the `capsLock` and
 `fn` modifiers, so those modifiers may be ignored by the compositor.
 

@@ -34,6 +34,7 @@ class HotkeyManagerPortalBackend : public HotkeyManagerLinuxBackend {
 
  private:
   bool EnsurePortal(std::string* error_message);
+  bool RegisterHostApplication(std::string* error_message);
   void ScheduleRebind();
   void CreateSession(guint generation);
   void BindShortcuts(guint generation);

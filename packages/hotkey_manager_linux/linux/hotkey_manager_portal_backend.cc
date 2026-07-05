@@ -15,6 +15,7 @@ constexpr char kPortalBusName[] = "org.freedesktop.portal.Desktop";
 constexpr char kPortalObjectPath[] = "/org/freedesktop/portal/desktop";
 constexpr char kGlobalShortcutsInterface[] =
     "org.freedesktop.portal.GlobalShortcuts";
+constexpr char kHostRegistryInterface[] = "org.freedesktop.host.portal.Registry";
 constexpr char kRequestInterface[] = "org.freedesktop.portal.Request";
 constexpr char kSessionInterface[] = "org.freedesktop.portal.Session";
 constexpr guint kRebindDelayMs = 100;
@@ -294,9 +295,26 @@ bool HotkeyManagerPortalBackend::EnsurePortal(std::string* error_message) {
   }
 
   g_autoptr(GError) error = nullptr;
-  connection_ = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+  g_autofree gchar* bus_address =
+      g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+  if (bus_address == nullptr) {
+    *error_message =
+        error != nullptr ? error->message : "No session bus address.";
+    return false;
+  }
+
+  connection_ = g_dbus_connection_new_for_address_sync(
+      bus_address,
+      static_cast<GDBusConnectionFlags>(
+          G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+          G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+      nullptr, nullptr, &error);
   if (connection_ == nullptr) {
     *error_message = error != nullptr ? error->message : "No session bus.";
+    return false;
+  }
+  if (!RegisterHostApplication(error_message)) {
+    g_clear_object(&connection_);
     return false;
   }
 
@@ -323,6 +341,45 @@ bool HotkeyManagerPortalBackend::EnsurePortal(std::string* error_message) {
   if (version == nullptr) {
     g_warning("GlobalShortcuts portal did not expose a cached version "
               "property.");
+  }
+
+  return true;
+}
+
+bool HotkeyManagerPortalBackend::RegisterHostApplication(
+    std::string* error_message) {
+  GApplication* application = g_application_get_default();
+  const gchar* application_id =
+      application != nullptr ? g_application_get_application_id(application)
+                             : nullptr;
+  if (application_id == nullptr || application_id[0] == '\0') {
+    *error_message =
+        "The GlobalShortcuts portal requires a GApplication application-id.";
+    return false;
+  }
+
+  GVariantBuilder options;
+  g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+
+  g_autoptr(GError) error = nullptr;
+  g_dbus_connection_call_sync(
+      connection_, kPortalBusName, kPortalObjectPath, kHostRegistryInterface,
+      "Register", g_variant_new("(sa{sv})", application_id, &options), nullptr,
+      G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
+  if (error != nullptr) {
+    if (g_strrstr(error->message, "already associated") != nullptr) {
+      return true;
+    }
+    if (g_strrstr(error->message, "App info not found") != nullptr) {
+      std::stringstream message;
+      message << "The GlobalShortcuts portal requires an installed .desktop "
+                 "file whose basename matches the application id '"
+              << application_id << "'. " << error->message;
+      *error_message = message.str();
+      return false;
+    }
+    *error_message = error->message;
+    return false;
   }
 
   return true;
