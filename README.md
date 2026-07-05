@@ -68,12 +68,19 @@ dependencies:
 #### Linux requirements
 
 - [`keybinder-3.0`](https://github.com/kupferlauncher/keybinder)
+- [`xdg-desktop-portal`](https://flatpak.github.io/xdg-desktop-portal/) with
+  GlobalShortcuts support for Wayland sessions
 
 Run the following command
 
 ```
 sudo apt-get install keybinder-3.0
 ```
+
+On X11, Linux global shortcuts are registered through `keybinder-3.0`. On
+Wayland, they are registered through the desktop portal, so the compositor may
+show a permission dialog the first time shortcuts are bound. Portal support for
+`capsLock` and `fn` modifiers depends on the compositor and may be unavailable.
 
 ### Usage
 
@@ -105,7 +112,8 @@ await hotKeyManager.register(
   keyDownHandler: (hotKey) {
     print('onKeyDown+${hotKey.toJson()}');
   },
-  // Only works on macOS.
+  // Only works on macOS and on Linux Wayland sessions that support the
+  // GlobalShortcuts portal.
   keyUpHandler: (hotKey){
     print('onKeyUp+${hotKey.toJson()}');
   } ,
