@@ -24,7 +24,7 @@ struct RequestContext {
   HotkeyManagerPortalBackend* backend;
   guint generation;
   guint subscription_id;
-  bool is_create_session;
+  PortalRequestKind kind;
 };
 
 gboolean RebindTimeoutCallback(gpointer user_data) {
@@ -43,12 +43,19 @@ void RequestResponseCallback(GDBusConnection* connection,
   g_variant_get(parameters, "(u@a{sv})", &response, &results);
 
   RequestContext* context = static_cast<RequestContext*>(user_data);
-  if (context->is_create_session) {
-    context->backend->HandleCreateSessionResponse(response, results,
-                                                  context->generation);
-  } else {
-    context->backend->HandleBindShortcutsResponse(response,
-                                                  context->generation);
+  switch (context->kind) {
+    case PortalRequestKind::create_session:
+      context->backend->HandleCreateSessionResponse(response, results,
+                                                    context->generation);
+      break;
+    case PortalRequestKind::list_shortcuts:
+      context->backend->HandleListShortcutsResponse(response, results,
+                                                    context->generation);
+      break;
+    case PortalRequestKind::bind_shortcuts:
+      context->backend->HandleBindShortcutsResponse(response,
+                                                    context->generation);
+      break;
   }
 
   context->backend->RemoveRequestSubscription(context->subscription_id);
@@ -67,19 +74,22 @@ void ShortcutSignalCallback(GDBusConnection* connection,
       signal_name, parameters);
 }
 
-std::string NextToken(const char* prefix, guint* counter) {
-  std::stringstream token;
-  token << prefix << "_" << g_get_monotonic_time() << "_" << (*counter)++;
-  return token.str();
+std::string NextToken(const char* prefix) {
+  g_autofree gchar* uuid = g_uuid_string_random();
+  std::string token = std::string(prefix) + "_";
+  for (const gchar* character = uuid; *character != '\0'; character++) {
+    token.push_back(g_ascii_isalnum(*character) ? *character : '_');
+  }
+  return token;
 }
 
 void SubscribeRequestResponse(GDBusConnection* connection,
                               const std::string& request_handle,
                               HotkeyManagerPortalBackend* backend,
                               guint generation,
-                              bool is_create_session) {
+                              PortalRequestKind kind) {
   RequestContext* context =
-      new RequestContext{backend, generation, 0, is_create_session};
+      new RequestContext{backend, generation, 0, kind};
   context->subscription_id = g_dbus_connection_signal_subscribe(
       connection, kPortalBusName, kRequestInterface, "Response",
       request_handle.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
@@ -149,8 +159,7 @@ HotkeyManagerPortalBackend::HotkeyManagerPortalBackend(
       activated_subscription_id_(0),
       deactivated_subscription_id_(0),
       rebind_source_id_(0),
-      generation_(0),
-      token_counter_(0) {}
+      generation_(0) {}
 
 HotkeyManagerPortalBackend::~HotkeyManagerPortalBackend() {
   if (rebind_source_id_ != 0) {
@@ -241,7 +250,43 @@ void HotkeyManagerPortalBackend::HandleCreateSessionResponse(guint32 response,
   g_variant_unref(session_handle_value);
 
   SubscribeShortcutSignals();
-  BindShortcuts(generation);
+  ListShortcuts(generation);
+}
+
+void HotkeyManagerPortalBackend::HandleListShortcutsResponse(
+    guint32 response,
+    GVariant* results,
+    guint generation) {
+  if (generation != generation_) {
+    return;
+  }
+  if (response != 0) {
+    g_warning("GlobalShortcuts ListShortcuts failed with response %u.",
+              response);
+    BindShortcuts(generation);
+    return;
+  }
+
+  std::vector<std::string> registered_shortcut_ids;
+  GVariant* shortcuts =
+      g_variant_lookup_value(results, "shortcuts",
+                             G_VARIANT_TYPE("a(sa{sv})"));
+  if (shortcuts != nullptr) {
+    GVariantIter iterator;
+    const gchar* shortcut_id = nullptr;
+    GVariant* properties = nullptr;
+    g_variant_iter_init(&iterator, shortcuts);
+    while (g_variant_iter_next(&iterator, "(&s@a{sv})", &shortcut_id,
+                               &properties)) {
+      registered_shortcut_ids.emplace_back(shortcut_id);
+      g_variant_unref(properties);
+    }
+    g_variant_unref(shortcuts);
+  }
+
+  if (HasMissingShortcuts(hotkeys_, registered_shortcut_ids)) {
+    BindShortcuts(generation);
+  }
 }
 
 void HotkeyManagerPortalBackend::HandleBindShortcutsResponse(guint32 response,
@@ -266,7 +311,9 @@ void HotkeyManagerPortalBackend::HandleShortcutSignal(
                 &timestamp, &options);
 
   bool matches_session = session_handle_ == session_handle;
-  if (matches_session && shortcut_id != nullptr) {
+  bool is_registered =
+      shortcut_id != nullptr && hotkeys_.find(shortcut_id) != hotkeys_.end();
+  if (matches_session && is_registered) {
     if (g_strcmp0(signal_name, "Activated") == 0) {
       SendHotkeyEvent(event_channel_, "onKeyDown", shortcut_id);
     } else if (g_strcmp0(signal_name, "Deactivated") == 0) {
@@ -395,8 +442,8 @@ void HotkeyManagerPortalBackend::ScheduleRebind() {
 void HotkeyManagerPortalBackend::CreateSession(guint generation) {
   GVariantBuilder options;
   g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-  std::string handle_token = NextToken("hkm_create", &token_counter_);
-  std::string session_token = NextToken("hkm_session", &token_counter_);
+  std::string handle_token = NextToken("hkm_create");
+  std::string session_token = NextToken("hkm_session");
   g_variant_builder_add(&options, "{sv}", "handle_token",
                         g_variant_new_string(handle_token.c_str()));
   g_variant_builder_add(&options, "{sv}", "session_handle_token",
@@ -414,7 +461,37 @@ void HotkeyManagerPortalBackend::CreateSession(guint generation) {
 
   const gchar* request_handle = nullptr;
   g_variant_get(result, "(&o)", &request_handle);
-  SubscribeRequestResponse(connection_, request_handle, this, generation, true);
+  SubscribeRequestResponse(connection_, request_handle, this, generation,
+                           PortalRequestKind::create_session);
+}
+
+void HotkeyManagerPortalBackend::ListShortcuts(guint generation) {
+  if (session_handle_.empty()) {
+    return;
+  }
+
+  GVariantBuilder options;
+  g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+  std::string handle_token = NextToken("hkm_list");
+  g_variant_builder_add(&options, "{sv}", "handle_token",
+                        g_variant_new_string(handle_token.c_str()));
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GVariant) result = g_dbus_proxy_call_sync(
+      portal_, "ListShortcuts",
+      g_variant_new("(oa{sv})", session_handle_.c_str(), &options),
+      G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
+  if (result == nullptr) {
+    g_warning("GlobalShortcuts ListShortcuts call failed: %s",
+              error != nullptr ? error->message : "unknown error");
+    BindShortcuts(generation);
+    return;
+  }
+
+  const gchar* request_handle = nullptr;
+  g_variant_get(result, "(&o)", &request_handle);
+  SubscribeRequestResponse(connection_, request_handle, this, generation,
+                           PortalRequestKind::list_shortcuts);
 }
 
 void HotkeyManagerPortalBackend::BindShortcuts(guint generation) {
@@ -444,7 +521,7 @@ void HotkeyManagerPortalBackend::BindShortcuts(guint generation) {
 
   GVariantBuilder options;
   g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-  std::string handle_token = NextToken("hkm_bind", &token_counter_);
+  std::string handle_token = NextToken("hkm_bind");
   g_variant_builder_add(&options, "{sv}", "handle_token",
                         g_variant_new_string(handle_token.c_str()));
 
@@ -462,7 +539,8 @@ void HotkeyManagerPortalBackend::BindShortcuts(guint generation) {
 
   const gchar* request_handle = nullptr;
   g_variant_get(result, "(&o)", &request_handle);
-  SubscribeRequestResponse(connection_, request_handle, this, generation, false);
+  SubscribeRequestResponse(connection_, request_handle, this, generation,
+                           PortalRequestKind::bind_shortcuts);
 }
 
 void HotkeyManagerPortalBackend::CloseSession() {
@@ -541,4 +619,17 @@ std::string HotkeyManagerPortalBackend::TriggerForHotkey(
   trigger_parts.push_back(key_name);
 
   return JoinTriggerParts(trigger_parts);
+}
+
+bool HasMissingShortcuts(
+    const std::map<std::string, PortalHotkey>& desired_hotkeys,
+    const std::vector<std::string>& registered_shortcut_ids) {
+  return std::any_of(
+      desired_hotkeys.begin(), desired_hotkeys.end(),
+      [&registered_shortcut_ids](const auto& desired_hotkey) {
+        return std::find(registered_shortcut_ids.begin(),
+                         registered_shortcut_ids.end(),
+                         desired_hotkey.first) ==
+               registered_shortcut_ids.end();
+      });
 }
